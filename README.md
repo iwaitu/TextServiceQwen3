@@ -1,5 +1,15 @@
 # TextServiceQwen3
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/downloads/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.104%2B-009688.svg)](https://fastapi.tiangolo.com/)
+[![gRPC](https://img.shields.io/badge/gRPC-1.60%2B-4285F4.svg)](https://grpc.io/)
+[![Docker](https://img.shields.io/badge/Docker-Supported-2496ED.svg)](https://www.docker.com/)
+[![GitHub stars](https://img.shields.io/github/stars/iwaitu/TextServiceQwen3.svg?style=social&label=Star)](https://github.com/iwaitu/TextServiceQwen3/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/iwaitu/TextServiceQwen3.svg?style=social&label=Fork)](https://github.com/iwaitu/TextServiceQwen3/network/members)
+[![GitHub issues](https://img.shields.io/github/issues/iwaitu/TextServiceQwen3.svg)](https://github.com/iwaitu/TextServiceQwen3/issues)
+[![GitHub release](https://img.shields.io/github/release/iwaitu/TextServiceQwen3.svg)](https://github.com/iwaitu/TextServiceQwen3/releases)
+
 基于 Qwen3 模型的文本处理服务，提供文本嵌入、重排序和分块功能。支持 FastAPI REST API 和 gRPC 两种接口方式。
 
 ## 功能特性
