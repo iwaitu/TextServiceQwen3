@@ -1,0 +1,20 @@
+# Core dependencies
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+
+# ML/AI dependencies (requires transformers>=4.51.0 as per your requirement)
+torch>=2.0.0
+transformers>=4.51.0
+tokenizers>=0.15.0
+
+# gRPC dependencies
+grpcio>=1.57.0
+grpcio-tools>=1.57.0
+protobuf>=4.24.0
+
+# System monitoring
+psutil>=5.9.0
+
+# Additional utilities
+requests>=2.31.0
