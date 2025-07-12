@@ -45,4 +45,3 @@ test_*.py
 
 # 静态文件(如果不需要)
 static/
-Models/
