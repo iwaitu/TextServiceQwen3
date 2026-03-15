@@ -7,6 +7,7 @@ set EMBEDDING_MODEL_DIR=%EMBEDDING_MODEL_DIR%
 if "%EMBEDDING_MODEL_DIR%"=="" set EMBEDDING_MODEL_DIR=%~dp0Models\qwen3-embedding-0.6b-onnx
 set RERANKER_MODEL_DIR=%RERANKER_MODEL_DIR%
 if "%RERANKER_MODEL_DIR%"=="" set RERANKER_MODEL_DIR=%~dp0Models\qwen3-reranker-seq-cls-onnx
+if "%GRPC_PORT%"=="" set GRPC_PORT=32688
 
 if not "%PYTHON_EXE%"=="" if exist "%PYTHON_EXE%" set "PYTHON_CMD=%PYTHON_EXE%"
 if not defined PYTHON_CMD if not "%CONDA_PREFIX%"=="" if exist "%CONDA_PREFIX%\python.exe" set "PYTHON_CMD=%CONDA_PREFIX%\python.exe"
@@ -22,14 +23,9 @@ if not defined PYTHON_CMD (
 	exit /b 1
 )
 
-echo 启动 Qwen3 ONNX REST Service...
+echo 启动 Qwen3 ONNX gRPC Service...
 echo.
-echo 服务将在以下地址启动:
-echo   - 主页: http://localhost:8000/
-echo   - Swagger UI (离线): http://localhost:8000/docs
-echo   - ReDoc: http://localhost:8000/redoc
-echo   - 健康检查: http://localhost:8000/health
-echo.
+echo gRPC 地址: localhost:%GRPC_PORT%
 echo 当前模型目录:
 echo   - Embedding: %EMBEDDING_MODEL_DIR%
 echo   - Reranker:  %RERANKER_MODEL_DIR%
@@ -38,9 +34,9 @@ echo   - Executable: %PYTHON_CMD%
 echo.
 echo %PYTHON_CMD% | findstr /I /C:"WindowsApps\python.exe" >nul
 if %ERRORLEVEL% EQU 0 (
-    echo 警告: 当前使用的是 Windows Store Python，可能无法加载期望的 CUDA 环境。
-    echo 建议先设置 PYTHON_EXE，或在正确的 conda/venv 环境中运行此脚本。
-    echo.
+	echo 警告: 当前使用的是 Windows Store Python，可能无法加载期望的 CUDA 环境。
+	echo 建议先设置 PYTHON_EXE，或在正确的 conda/venv 环境中运行此脚本。
+	echo.
 )
 echo.
 echo ONNX 环境检测结果:
@@ -55,5 +51,5 @@ echo 按 Ctrl+C 停止服务
 echo.
 
 cd /d "%~dp0"
-"%PYTHON_CMD%" main.py
+"%PYTHON_CMD%" grpc_service.py
 pause

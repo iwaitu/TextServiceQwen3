@@ -1,95 +1,288 @@
+from contextlib import asynccontextmanager
+import logging
+import os
+from typing import List, Optional
+
 from fastapi import FastAPI, HTTPException
 from fastapi.openapi.docs import (
     get_redoc_html,
     get_swagger_ui_html,
     get_swagger_ui_oauth2_redirect_html,
 )
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
+import numpy as np
+import onnxruntime as ort
+from onnx_provider_utils import choose_execution_providers, provider_chain_to_string
 from pydantic import BaseModel
-from typing import List, Optional
-from contextlib import asynccontextmanager
-import torch
-import torch.nn.functional as F
-from torch import Tensor
-from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM
-import os
+from transformers import AutoTokenizer
 
-# Use Qwen3-Embedding model for embedding service
-model_name = "Models/Qwen3-Embedding-0.6B"
-reranker_model_name = "Models/Qwen3-Reranker-0.6B"
 
-# Global variables for models and tokenizers
-tokenizer: Optional[AutoTokenizer] = None
-model: Optional[AutoModel] = None
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(PROJECT_ROOT, "Models")
+
+EMBEDDING_DIR_DEFAULT = os.path.join(MODELS_DIR, "qwen3-embedding-0.6b-onnx")
+RERANKER_DIR_DEFAULT = os.path.join(MODELS_DIR, "qwen3-reranker-seq-cls-onnx")
+
+EMBEDDING_DIR = os.environ.get("EMBEDDING_MODEL_DIR", EMBEDDING_DIR_DEFAULT)
+RERANKER_DIR = os.environ.get("RERANKER_MODEL_DIR", RERANKER_DIR_DEFAULT)
+EMBEDDING_MODEL_PATH = os.environ.get(
+    "EMBEDDING_MODEL_PATH",
+    os.path.join(EMBEDDING_DIR, "model.onnx"),
+)
+RERANKER_MODEL_PATH = os.environ.get(
+    "RERANKER_MODEL_PATH",
+    os.path.join(RERANKER_DIR, "model.onnx"),
+)
+
+EMBED_MAX_LENGTH = int(os.environ.get("EMBEDDING_MAX_LENGTH", "8192"))
+RERANK_MAX_LENGTH = int(os.environ.get("RERANK_MAX_LENGTH", "8192"))
+EMBED_BATCH_SIZE = max(1, int(os.environ.get("EMBEDDING_BATCH_SIZE", "8")))
+
+DEFAULT_RERANK_INSTRUCTION = (
+    "Given a web search query, retrieve relevant passages that answer the query"
+)
+RERANK_PREFIX = (
+    "<|im_start|>system\n"
+    'Judge whether the Document meets the requirements based on the Query and the '
+    'Instruct provided. Note that the answer can only be "yes" or "no".'
+    "<|im_end|>\n<|im_start|>user\n"
+)
+RERANK_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+LOGGER = logging.getLogger(__name__)
+
+embedding_tokenizer: Optional[AutoTokenizer] = None
 reranker_tokenizer: Optional[AutoTokenizer] = None
-reranker_model: Optional[AutoModelForCausalLM] = None
-device: Optional[str] = None
-token_false_id: Optional[int] = None
-token_true_id: Optional[int] = None
-max_length = 8192
-prefix_tokens: Optional[List[int]] = None
-suffix_tokens: Optional[List[int]] = None
+embedding_session: Optional[ort.InferenceSession] = None
+reranker_session: Optional[ort.InferenceSession] = None
+runtime_provider: Optional[str] = None
+embedding_batch_size = 1
+
+
+def _resolve_model_name(model_dir, fallback_name):
+    return os.path.basename(os.path.normpath(model_dir)) or fallback_name
+
+
+def _resolve_embedding_batch_size(session, tokenizer, requested_batch_size):
+    if requested_batch_size <= 1:
+        return 1
+
+    probe_texts = ["batch probe text 1", "batch probe text 2"]
+    try:
+        encoded = tokenizer(
+            probe_texts,
+            padding=True,
+            truncation=True,
+            return_tensors="np",
+            max_length=EMBED_MAX_LENGTH,
+        )
+        model_inputs = {item.name for item in session.get_inputs()}
+        input_feed = {
+            key: value.astype(np.int64)
+            for key, value in encoded.items()
+            if key in model_inputs
+        }
+        session.run(None, input_feed)
+        return requested_batch_size
+    except Exception as exc:
+        LOGGER.warning(
+            "Embedding ONNX model does not support true batching on current runtime; "
+            "requested_batch_size=%s fallback_batch_size=1 error=%s",
+            requested_batch_size,
+            exc,
+        )
+        return 1
+
+
+def _get_execution_providers():
+    providers, reason, available = choose_execution_providers()
+    LOGGER.info(
+        "Selected ONNX providers: %s | reason=%s | available=%s",
+        provider_chain_to_string(providers),
+        reason,
+        available,
+    )
+    return providers
+
+
+def _create_session(model_path):
+    session_options = ort.SessionOptions()
+    session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    session_options.log_severity_level = 3
+    return ort.InferenceSession(
+        model_path,
+        sess_options=session_options,
+        providers=_get_execution_providers(),
+    )
+
+
+def _last_token_pool(last_hidden_states, attention_mask):
+    if attention_mask.ndim != 2:
+        raise ValueError("attention_mask must be 2-dimensional")
+
+    if np.all(attention_mask[:, -1] == 1):
+        return last_hidden_states[:, -1, :]
+
+    sequence_lengths = np.clip(attention_mask.sum(axis=1) - 1, a_min=0, a_max=None)
+    batch_indices = np.arange(last_hidden_states.shape[0])
+    return last_hidden_states[batch_indices, sequence_lengths, :]
+
+
+def _normalize_embeddings(embeddings):
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    return embeddings / np.clip(norms, a_min=1e-12, a_max=None)
+
+
+def _sigmoid(values):
+    values = np.asarray(values, dtype=np.float32)
+    positive = values >= 0
+    negative = ~positive
+    result = np.empty_like(values, dtype=np.float32)
+    result[positive] = 1.0 / (1.0 + np.exp(-values[positive]))
+    exp_values = np.exp(values[negative])
+    result[negative] = exp_values / (1.0 + exp_values)
+    return result
+
+
+def _ensure_ready():
+    if embedding_tokenizer is None or reranker_tokenizer is None:
+        raise RuntimeError("Tokenizers are not loaded")
+    if embedding_session is None or reranker_session is None:
+        raise RuntimeError("ONNX sessions are not loaded")
+
+
+def _format_instruction(instruction, query, document):
+    rerank_instruction = instruction or DEFAULT_RERANK_INSTRUCTION
+    return (
+        f"{RERANK_PREFIX}<Instruct>: {rerank_instruction}\n"
+        f"<Query>: {query}\n"
+        f"<Document>: {document}{RERANK_SUFFIX}"
+    )
+
+
+def _build_embedding_inputs(texts):
+    if embedding_tokenizer is None or embedding_session is None:
+        raise RuntimeError("Embedding model not loaded")
+
+    encoded = embedding_tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        return_tensors="np",
+        max_length=EMBED_MAX_LENGTH,
+    )
+    model_inputs = {item.name for item in embedding_session.get_inputs()}
+    input_feed = {
+        key: value.astype(np.int64)
+        for key, value in encoded.items()
+        if key in model_inputs
+    }
+    return encoded, input_feed
+
+
+def _run_embedding_batch(texts):
+    if embedding_tokenizer is None or embedding_session is None:
+        raise RuntimeError("Embedding model not loaded")
+
+    if not texts:
+        return np.empty((0, 0), dtype=np.float32), [], 0
+
+    embeddings = []
+    text_lengths = []
+    total_tokens = 0
+    for start in range(0, len(texts), embedding_batch_size):
+        chunk_texts = texts[start:start + embedding_batch_size]
+        encoded, input_feed = _build_embedding_inputs(chunk_texts)
+        outputs = embedding_session.run(None, input_feed)
+        last_hidden_state = np.asarray(outputs[0])
+        pooled = _last_token_pool(last_hidden_state, encoded["attention_mask"])
+        normalized = _normalize_embeddings(pooled).astype(np.float32)
+        embeddings.extend(normalized)
+        text_lengths.extend(
+            len(embedding_tokenizer.encode(text, add_special_tokens=False))
+            for text in chunk_texts
+        )
+        total_tokens += int(np.asarray(encoded["attention_mask"]).sum())
+
+    return np.stack(embeddings, axis=0), text_lengths, total_tokens
+
+
+def _build_rerank_inputs(pairs):
+    if reranker_tokenizer is None or reranker_session is None:
+        raise RuntimeError("Reranker model not loaded")
+
+    encoded = reranker_tokenizer(
+        pairs,
+        padding=True,
+        truncation=True,
+        return_tensors="np",
+        max_length=RERANK_MAX_LENGTH,
+    )
+    model_inputs = {item.name for item in reranker_session.get_inputs()}
+    input_feed = {
+        key: value.astype(np.int64)
+        for key, value in encoded.items()
+        if key in model_inputs
+    }
+    return encoded, input_feed
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan context manager for model loading and cleanup"""
-    global tokenizer, model, reranker_tokenizer, reranker_model, device
-    global token_false_id, token_true_id, prefix_tokens, suffix_tokens
-    
-    # Startup: Load models
-    print("Starting up: Loading models...")
+    global embedding_tokenizer, reranker_tokenizer
+    global embedding_session, reranker_session, runtime_provider, embedding_batch_size
+
+    LOGGER.info("Starting up: loading ONNX models...")
     try:
-        # Load embedding model
-        tokenizer = AutoTokenizer.from_pretrained(model_name, model_max_length=8192, padding_side='left')
-        model = AutoModel.from_pretrained(model_name)
-        
-        # Load reranker model
-        reranker_tokenizer = AutoTokenizer.from_pretrained(reranker_model_name, padding_side='left')
-        reranker_model = AutoModelForCausalLM.from_pretrained(reranker_model_name).eval()
-        
-        # Use GPU if available
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model.to(device)  # type: ignore
-        reranker_model.to(device)  # type: ignore
-        model.eval()  # type: ignore
-        
-        # Reranker specific tokens and settings
-        token_false_id = reranker_tokenizer.convert_tokens_to_ids("no")  # type: ignore
-        token_true_id = reranker_tokenizer.convert_tokens_to_ids("yes")  # type: ignore
-        
-        prefix = "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n"
-        suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-        prefix_tokens = reranker_tokenizer.encode(prefix, add_special_tokens=False)  # type: ignore
-        suffix_tokens = reranker_tokenizer.encode(suffix, add_special_tokens=False)  # type: ignore
-        
-        print(f"Models loaded successfully on device: {device}")
-        
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        raise RuntimeError(f"Failed to load model: {e}")
-    
-    yield  # Application is running
-    
-    # Shutdown: Cleanup resources
-    print("Shutting down: Cleaning up resources...")
-    try:
-        if device == "cuda":
-            torch.cuda.empty_cache()
-        print("Resources cleaned up successfully")
-    except Exception as e:
-        print(f"Error during cleanup: {e}")
+        embedding_tokenizer = AutoTokenizer.from_pretrained(
+            EMBEDDING_DIR,
+            model_max_length=EMBED_MAX_LENGTH,
+            padding_side="left",
+            trust_remote_code=True,
+        )
+        reranker_tokenizer = AutoTokenizer.from_pretrained(
+            RERANKER_DIR,
+            model_max_length=RERANK_MAX_LENGTH,
+            padding_side="left",
+            trust_remote_code=True,
+        )
+        embedding_session = _create_session(EMBEDDING_MODEL_PATH)
+        reranker_session = _create_session(RERANKER_MODEL_PATH)
+        embedding_batch_size = _resolve_embedding_batch_size(
+            embedding_session,
+            embedding_tokenizer,
+            EMBED_BATCH_SIZE,
+        )
+        runtime_provider = embedding_session.get_providers()[0]
+        LOGGER.info("Embedding providers: %s", embedding_session.get_providers())
+        LOGGER.info("Reranker providers: %s", reranker_session.get_providers())
+        LOGGER.info("Embedding effective batch size: %s", embedding_batch_size)
+    except Exception as exc:
+        LOGGER.exception("Failed to load ONNX models")
+        raise RuntimeError(f"Failed to load ONNX models: {exc}") from exc
+
+    yield
+
+    embedding_session = None
+    reranker_session = None
+    embedding_tokenizer = None
+    reranker_tokenizer = None
+    runtime_provider = None
+    embedding_batch_size = 1
 
 
 app = FastAPI(
     title="Qwen3 Text Service",
-    description="A FastAPI service for text embeddings and reranking using Qwen3-Embedding-0.6B and Qwen3-Reranker-0.6B models",
+    description="A FastAPI service for text embeddings and reranking using ONNX Qwen3 models",
     version="1.0.0",
-    docs_url=None,  # Disable default docs
-    redoc_url=None,  # Disable default redoc
-    lifespan=lifespan
+    docs_url=None,
+    redoc_url=None,
+    lifespan=lifespan,
 )
+
+embedding_model_name = _resolve_model_name(EMBEDDING_DIR, "qwen3-embedding-0.6b-onnx")
+reranker_model_name = _resolve_model_name(RERANKER_DIR, "qwen3-reranker-seq-cls-onnx")
 
 
 class EmbedTextRequest(BaseModel):
@@ -111,7 +304,7 @@ class SplitTextRequest(BaseModel):
 class SplitTextResponse(BaseModel):
     chunks: List[str]
     total_chunks: int
-    model: str = model_name
+    model: str = embedding_model_name
 
 
 class RerankResult(BaseModel):
@@ -139,244 +332,76 @@ class Usage(BaseModel):
 
 class EmbedTextResponse(BaseModel):
     data: List[EmbeddingData]
-    model: str = model_name
+    model: str = embedding_model_name
     object: str = "list"
     usage: Usage
 
 
 @app.post("/embed_text", response_model=EmbedTextResponse, tags=["Embedding"])
 async def embed_text(request: EmbedTextRequest):
-    """
-    Generate embeddings for documents without instruction formatting.
-    
-    This endpoint is optimized for document/passage embeddings where you don't 
-    need instruction formatting. Use this for embedding knowledge base documents,
-    passages, or any content that will be retrieved by queries.
-    
-    - **input**: List of document/passage strings to embed
-    
-    Example:
-    ```json
-    {
-        "input": [
-            "The capital of China is Beijing.",
-            "Gravity is a force that attracts two bodies towards each other."
-        ]
-    }
-    ```
-    
-    Note: The task_description field is ignored for this endpoint.
-    """
-    if tokenizer is None or model is None or device is None:
-        raise HTTPException(status_code=500, detail="Models not loaded. Please wait for startup to complete.")
-    
     try:
-        inputs = request.input
-        
-        # Tokenize inputs without instruction formatting
-        tokenized_inputs = tokenizer(inputs, padding=True, truncation=True, return_tensors="pt", max_length=8192)  # type: ignore
-        tokenized_inputs = {k: v.to(device) for k, v in tokenized_inputs.items()}
-        
-        with torch.no_grad():
-            outputs = model(**tokenized_inputs)  # type: ignore
-            embeddings = last_token_pool(outputs.last_hidden_state, tokenized_inputs['attention_mask'])
-            embeddings = F.normalize(embeddings, p=2, dim=1)
-        # 推理后清理显存
-        if device == "cuda":
-            torch.cuda.empty_cache()
+        _ensure_ready()
+        embeddings, text_lengths, total_tokens = _run_embedding_batch(request.input)
 
-        embeddings_list = embeddings.tolist()
+        if embedding_tokenizer is None:
+            raise RuntimeError("Embedding tokenizer not loaded")
+
         data = [
-            EmbeddingData(embedding=emb, index=i, tokens_length=len(tokenizer.encode(text)))  # type: ignore
-            for i, (emb, text) in enumerate(zip(embeddings_list, inputs))
+            EmbeddingData(
+                embedding=embedding,
+                index=index,
+                tokens_length=text_length,
+            )
+            for index, (embedding, text_length) in enumerate(zip(embeddings.tolist(), text_lengths))
         ]
-        # 统计实际输入到模型的 token 数量（包含 padding 和 truncation 后的结果）
-        total_tokens = sum(len(ids) for ids in tokenized_inputs['input_ids'])  # type: ignore
         usage = Usage(prompt_tokens=total_tokens, total_tokens=total_tokens)
         return EmbedTextResponse(data=data, usage=usage)
-
-    except Exception as e:
-        # 异常时也清理显存
-        if device == "cuda":
-            torch.cuda.empty_cache()
-        print(f"Error during embedding: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        LOGGER.exception("Error during embedding")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/rerank", response_model=RerankResponse, tags=["Reranking"])
 async def simple_rerank(request: RerankRequest):
-    """
-    Rerank documents based on their relevance to a query using Qwen3-Reranker-0.6B.
-    
-    This endpoint takes a query and a list of documents, then returns them 
-    ranked by relevance score in descending order.
-    
-    - **query**: The search query string
-    - **documents**: List of document strings to rank
-    - **instruction**: Optional instruction for the reranking task
-    
-    Example:
-    ```json
-    {
-        "query": "What is the capital of China?",
-        "documents": [
-            "The capital of China is Beijing.",
-            "Gravity is a force that attracts two bodies towards each other.",
-            "Paris is the capital of France."
-        ],
-        "instruction": "Given a web search query, retrieve relevant passages that answer the query"
-    }
-    ```
-    """
-    if reranker_model is None or reranker_tokenizer is None or device is None:
-        raise HTTPException(status_code=500, detail="Reranker models not loaded. Please wait for startup to complete.")
-    
     try:
-        query = request.query
-        documents = request.documents
-        instruction = request.instruction
-        
-        # Format input pairs
-        pairs = [format_instruction(instruction, query, doc) for doc in documents]
-        
-        # Process inputs
-        inputs = process_inputs(pairs)
-        
-        # Compute scores
-        scores = compute_logits(inputs)
-        
-        # 推理后清理显存
-        if device == "cuda":
-            torch.cuda.empty_cache()
-        
-        # Create results with original indices and sort by score (descending)
-        results = [
-            RerankResult(document=doc, score=score, index=i)
-            for i, (doc, score) in enumerate(zip(documents, scores))
+        _ensure_ready()
+        pairs = [
+            _format_instruction(request.instruction, request.query, doc)
+            for doc in request.documents
         ]
-        
-        # Sort by score in descending order
-        results.sort(key=lambda x: x.score, reverse=True)
-        
+        _, input_feed = _build_rerank_inputs(pairs)
+        logits = np.asarray(reranker_session.run(None, input_feed)[0]).reshape(-1)  # type: ignore[union-attr]
+        scores = _sigmoid(logits)
+
+        results = [
+            RerankResult(document=doc, score=float(score), index=index)
+            for index, (doc, score) in enumerate(zip(request.documents, scores.tolist()))
+        ]
+        results.sort(key=lambda item: item.score, reverse=True)
         return RerankResponse(results=results)
-        
-    except Exception as e:
-        # 异常时也清理显存
-        if device == "cuda":
-            torch.cuda.empty_cache()
-        print(f"Error during reranking: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/split_text", response_model=SplitTextResponse, tags=["Text Processing"])
-async def split_text_api(request: SplitTextRequest):
-    """
-    Split text into chunks based on token count with optional overlap.
-    
-    This endpoint splits a given text into smaller chunks based on the specified
-    chunk size (in tokens) and overlap size (in tokens).
-    
-    - **text**: The input text to be split
-    - **chunksize**: The maximum number of tokens per chunk (must be > 0)
-    - **overlap_size**: The number of tokens to overlap between chunks (default: 0, must be >= 0)
-    
-    Example:
-    ```json
-    {
-        "text": "This is a long text that needs to be split into smaller chunks for processing.",
-        "chunksize": 10,
-        "overlap_size": 2
-    }
-    ```
-    """
-    try:
-        chunks = SplitText(request.text, request.chunksize, request.overlap_size)
-        return SplitTextResponse(
-            chunks=chunks,
-            total_chunks=len(chunks)
-        )
-    except Exception as e:
-        print(f"Error during text splitting: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-def last_token_pool(last_hidden_states: Tensor,
-                 attention_mask: Tensor) -> Tensor:
-    left_padding = (attention_mask[:, -1].sum() == attention_mask.shape[0])
-    if left_padding:
-        return last_hidden_states[:, -1]
-    else:
-        sequence_lengths = attention_mask.sum(dim=1) - 1
-        batch_size = last_hidden_states.shape[0]
-        return last_hidden_states[torch.arange(batch_size, device=last_hidden_states.device), sequence_lengths]
-
-
-def format_instruction(instruction, query, doc):
-    """Format instruction for reranker model"""
-    if instruction is None:
-        instruction = 'Given a web search query, retrieve relevant passages that answer the query'
-    output = "<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {doc}".format(
-        instruction=instruction, query=query, doc=doc)
-    return output
-
-
-def process_inputs(pairs):
-    """Process input pairs for reranker model"""
-    if reranker_tokenizer is None or prefix_tokens is None or suffix_tokens is None:
-        raise RuntimeError("Reranker tokenizer or tokens not initialized")
-    
-    inputs = reranker_tokenizer(  # type: ignore
-        pairs, padding=False, truncation='longest_first',
-        return_attention_mask=False, max_length=max_length - len(prefix_tokens) - len(suffix_tokens)
-    )
-    for i, ele in enumerate(inputs['input_ids']):
-        inputs['input_ids'][i] = prefix_tokens + ele + suffix_tokens
-    inputs = reranker_tokenizer.pad(inputs, padding=True, return_tensors="pt", max_length=max_length)  # type: ignore
-    for key in inputs:
-        inputs[key] = inputs[key].to(device)
-    return inputs
-
-
-@torch.no_grad()
-def compute_logits(inputs, **kwargs):
-    """Compute reranker scores"""
-    if reranker_model is None or token_true_id is None or token_false_id is None:
-        raise RuntimeError("Reranker model or tokens not initialized")
-    
-    batch_scores = reranker_model(**inputs).logits[:, -1, :]  # type: ignore
-    true_vector = batch_scores[:, token_true_id]
-    false_vector = batch_scores[:, token_false_id]
-    batch_scores = torch.stack([false_vector, true_vector], dim=1)
-    batch_scores = torch.nn.functional.log_softmax(batch_scores, dim=1)
-    scores = batch_scores[:, 1].exp().tolist()
-    return scores
-
-
-def get_detailed_instruct(task_description: str, query: str) -> str:
-    return f'Instruct: {task_description}\nQuery: {query}'
+    except Exception as exc:
+        LOGGER.exception("Error during reranking")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 def SplitText(text: str, chunksize: int, overlap_size: int) -> List[str]:
-    """
-    按照 chunksize（token数量）和 overlap_size（token数量）将文本切分为多个段落，返回 List[str]
-    """
-    global tokenizer
-    if tokenizer is None:
-        raise RuntimeError("tokenizer 未初始化")
+    if embedding_tokenizer is None:
+        raise RuntimeError("Embedding tokenizer not loaded")
     if chunksize <= 0:
-        raise ValueError("chunksize 必须大于 0")
+        raise ValueError("chunksize must be greater than 0")
     if overlap_size < 0:
-        raise ValueError("overlap_size 不能为负数")
-    # 分词
-    tokens = tokenizer.encode(text, add_special_tokens=False)  # type: ignore
+        raise ValueError("overlap_size cannot be negative")
+    if overlap_size >= chunksize:
+        raise ValueError("overlap_size must be smaller than chunksize")
+
+    tokens = embedding_tokenizer.encode(text, add_special_tokens=False)
     result = []
     start = 0
     while start < len(tokens):
         end = min(start + chunksize, len(tokens))
         chunk_tokens = tokens[start:end]
-        # 先将 token id 转为 token，再转为字符串，避免中文乱码
-        chunk_token_strs = tokenizer.convert_ids_to_tokens(chunk_tokens)  # type: ignore
-        chunk_text = tokenizer.convert_tokens_to_string(chunk_token_strs)  # type: ignore
+        chunk_token_strs = embedding_tokenizer.convert_ids_to_tokens(chunk_tokens)
+        chunk_text = embedding_tokenizer.convert_tokens_to_string(chunk_token_strs)
         result.append(chunk_text)
         if end == len(tokens):
             break
@@ -384,10 +409,20 @@ def SplitText(text: str, chunksize: int, overlap_size: int) -> List[str]:
     return result
 
 
-# Mount static files for offline Swagger UI
+@app.post("/split_text", response_model=SplitTextResponse, tags=["Text Processing"])
+async def split_text_api(request: SplitTextRequest):
+    try:
+        chunks = SplitText(request.text, request.chunksize, request.overlap_size)
+        return SplitTextResponse(chunks=chunks, total_chunks=len(chunks))
+    except Exception as exc:
+        LOGGER.exception("Error during text splitting")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.exists(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
 
 @app.get("/docs", include_in_schema=False)
 async def custom_swagger_ui_html():
@@ -397,8 +432,9 @@ async def custom_swagger_ui_html():
         oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
         swagger_js_url="/static/swagger-ui-bundle.js",
         swagger_css_url="/static/swagger-ui.css",
-        swagger_ui_parameters={"syntaxHighlight.theme": "obsidian"}
+        swagger_ui_parameters={"syntaxHighlight.theme": "obsidian"},
     )
+
 
 @app.get("/redoc", include_in_schema=False)
 async def redoc_html():
@@ -408,26 +444,33 @@ async def redoc_html():
         redoc_js_url="https://unpkg.com/redoc@2.1.0/bundles/redoc.standalone.js",
     )
 
+
 @app.get("/oauth2-redirect", include_in_schema=False)
 async def swagger_ui_redirect():
     return get_swagger_ui_oauth2_redirect_html()
 
+
 @app.get("/", include_in_schema=False)
 async def root():
-    """Redirect to API documentation"""
     return RedirectResponse(url="/docs")
+
 
 @app.get("/health", tags=["Health"])
 async def health_check():
-    """Health check endpoint"""
     return {
-        "status": "healthy",
-        "embedding_model": model_name,
+        "status": "healthy" if embedding_session is not None and reranker_session is not None else "loading",
+        "embedding_model": embedding_model_name,
         "reranker_model": reranker_model_name,
-        "device": device,
-        "service": "Qwen3 Text Service"
+        "device": runtime_provider,
+        "service": "Qwen3 Text Service",
     }
+
 
 if __name__ == "__main__":
     import uvicorn
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+    )
     uvicorn.run(app, host="0.0.0.0", port=8000)

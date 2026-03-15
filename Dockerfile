@@ -8,23 +8,28 @@ WORKDIR /app
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 ENV CUDA_VISIBLE_DEVICES=0
+ENV EMBEDDING_MODEL_DIR=/app/Models/qwen3-embedding-0.6b-onnx
+ENV RERANKER_MODEL_DIR=/app/Models/qwen3-reranker-seq-cls-onnx
+ENV ONNX_EXECUTION_PROVIDERS=CUDAExecutionProvider,CPUExecutionProvider
 
-# 安装Python 3.10和系统依赖
-RUN apt-get update && apt-get install -y \
-    python3.10 \
-    python3.10-dev \
+# 安装 Python 和系统依赖。Ubuntu 22.04 默认提供 Python 3.10，直接使用 python3 包更稳妥。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-dev \
     python3-pip \
+    python-is-python3 \
     build-essential \
     git \
-    && ln -s /usr/bin/python3.10 /usr/bin/python \
-    && ln -s /usr/bin/pip3 /usr/bin/pip \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制requirements.txt文件
 COPY requirements.txt .
 
-# 安装Python依赖
-RUN pip install --no-cache-dir -r requirements.txt
+# 安装 Python 依赖。Docker 镜像只安装 GPU 版 ONNX Runtime，避免先装 CPU 版再卸载导致构建失败。
+RUN grep -v "^onnxruntime\(\[.*\]\)\?>=" requirements.txt > requirements.docker.txt \
+    && python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir -r requirements.docker.txt \
+    && python -m pip install --no-cache-dir "onnxruntime-gpu>=1.18.0"
 
 # 复制项目文件
 COPY . .
@@ -37,7 +42,7 @@ EXPOSE 32688
 
 # 设置健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import grpc; channel = grpc.insecure_channel('localhost:32688'); channel.close()" || exit 1
+    CMD python -c "import grpc, text_service_pb2, text_service_pb2_grpc; channel = grpc.insecure_channel('localhost:32688'); stub = text_service_pb2_grpc.TextGrpcServiceStub(channel); response = stub.HealthCheck(text_service_pb2.HealthCheckRequest(), timeout=5); channel.close(); raise SystemExit(0 if response.status == 'healthy' else 1)" || exit 1
 
 # 启动gRPC服务
 CMD ["python", "grpc_service.py"]
