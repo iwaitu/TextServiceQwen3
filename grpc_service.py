@@ -1,5 +1,7 @@
+import gc
 import logging
 import os
+import threading
 import time
 from concurrent import futures
 
@@ -33,6 +35,9 @@ RERANKER_MODEL_PATH = os.environ.get(
 EMBED_MAX_LENGTH = int(os.environ.get("EMBEDDING_MAX_LENGTH", "8192"))
 RERANK_MAX_LENGTH = int(os.environ.get("RERANK_MAX_LENGTH", "8192"))
 EMBED_BATCH_SIZE = max(1, int(os.environ.get("EMBEDDING_BATCH_SIZE", "8")))
+RERANK_BATCH_SIZE = max(1, int(os.environ.get("RERANK_BATCH_SIZE", "4")))
+_MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_INFERENCES", "2"))
+_inference_semaphore = threading.Semaphore(_MAX_CONCURRENT)
 
 DEFAULT_RERANK_INSTRUCTION = (
     "Given a web search query, retrieve relevant passages that answer the query"
@@ -200,18 +205,40 @@ class TextGrpcServiceServicer(text_service_pb2_grpc.TextGrpcServiceServicer):
         for start in range(0, len(texts), self.embedding_batch_size):
             chunk_texts = texts[start:start + self.embedding_batch_size]
             encoded, input_feed = self._build_embedding_inputs(chunk_texts)
-            outputs = self.embedding_session.run(None, input_feed)
+            with _inference_semaphore:
+                outputs = self.embedding_session.run(None, input_feed)
             last_hidden_state = np.asarray(outputs[0])
+            del outputs
             pooled = _last_token_pool(last_hidden_state, encoded["attention_mask"])
+            del last_hidden_state
             normalized = _normalize_embeddings(pooled).astype(np.float32)
+            del pooled
             embeddings.extend(normalized)
             text_lengths.extend(
                 len(self.embedding_tokenizer.encode(text, add_special_tokens=False))
                 for text in chunk_texts
             )
             total_tokens += int(np.asarray(encoded["attention_mask"]).sum())
+            del input_feed
 
         return np.stack(embeddings, axis=0), text_lengths, total_tokens
+
+    def _run_rerank_batch(self, pairs):
+        """对所有 pairs 分批推理，每批推理后立即释放中间张量，避免显存峰值过高。"""
+        if not pairs:
+            return np.array([], dtype=np.float32)
+
+        all_logits = []
+        for start in range(0, len(pairs), RERANK_BATCH_SIZE):
+            chunk = pairs[start:start + RERANK_BATCH_SIZE]
+            _, input_feed = self._build_rerank_inputs(chunk)
+            with _inference_semaphore:
+                outputs = self.reranker_session.run(None, input_feed)
+            logits = np.asarray(outputs[0]).reshape(-1)
+            del outputs, input_feed
+            all_logits.append(logits)
+
+        return np.concatenate(all_logits)
 
     def _build_rerank_inputs(self, pairs):
         encoded = self.reranker_tokenizer(
@@ -235,8 +262,7 @@ class TextGrpcServiceServicer(text_service_pb2_grpc.TextGrpcServiceServicer):
 
         try:
             pairs = [_format_instruction(None, query, doc) for doc in documents]
-            _, input_feed = self._build_rerank_inputs(pairs)
-            logits = np.asarray(self.reranker_session.run(None, input_feed)[0]).reshape(-1)
+            logits = self._run_rerank_batch(pairs)
             scores = _sigmoid(logits)
 
             results = []
@@ -377,15 +403,27 @@ def serve():
     )
 
     port = os.environ.get("GRPC_PORT", "32688")
+    servicer = TextGrpcServiceServicer()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     text_service_pb2_grpc.add_TextGrpcServiceServicer_to_server(
-        TextGrpcServiceServicer(),
+        servicer,
         server,
     )
     server.add_insecure_port(f"[::]:{port}")
     server.start()
     LOGGER.info("gRPC server started on port %s", port)
-    server.wait_for_termination()
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        LOGGER.info("Received interrupt, stopping gRPC server...")
+        server.stop(grace=5)
+    finally:
+        servicer.embedding_session = None
+        servicer.reranker_session = None
+        servicer.embedding_tokenizer = None
+        servicer.reranker_tokenizer = None
+        gc.collect()
+        LOGGER.info("gRPC server stopped, GPU resources released.")
 
 
 if __name__ == "__main__":

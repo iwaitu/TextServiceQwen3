@@ -1,6 +1,8 @@
 from contextlib import asynccontextmanager
+import gc
 import logging
 import os
+import threading
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -38,6 +40,9 @@ RERANKER_MODEL_PATH = os.environ.get(
 EMBED_MAX_LENGTH = int(os.environ.get("EMBEDDING_MAX_LENGTH", "8192"))
 RERANK_MAX_LENGTH = int(os.environ.get("RERANK_MAX_LENGTH", "8192"))
 EMBED_BATCH_SIZE = max(1, int(os.environ.get("EMBEDDING_BATCH_SIZE", "8")))
+RERANK_BATCH_SIZE = max(1, int(os.environ.get("RERANK_BATCH_SIZE", "4")))
+_MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_INFERENCES", "2"))
+_inference_semaphore = threading.Semaphore(_MAX_CONCURRENT)
 
 DEFAULT_RERANK_INSTRUCTION = (
     "Given a web search query, retrieve relevant passages that answer the query"
@@ -194,18 +199,44 @@ def _run_embedding_batch(texts):
     for start in range(0, len(texts), embedding_batch_size):
         chunk_texts = texts[start:start + embedding_batch_size]
         encoded, input_feed = _build_embedding_inputs(chunk_texts)
-        outputs = embedding_session.run(None, input_feed)
+        with _inference_semaphore:
+            outputs = embedding_session.run(None, input_feed)
         last_hidden_state = np.asarray(outputs[0])
+        del outputs
         pooled = _last_token_pool(last_hidden_state, encoded["attention_mask"])
+        del last_hidden_state
         normalized = _normalize_embeddings(pooled).astype(np.float32)
+        del pooled
         embeddings.extend(normalized)
         text_lengths.extend(
             len(embedding_tokenizer.encode(text, add_special_tokens=False))
             for text in chunk_texts
         )
         total_tokens += int(np.asarray(encoded["attention_mask"]).sum())
+        del input_feed
 
     return np.stack(embeddings, axis=0), text_lengths, total_tokens
+
+
+def _run_rerank_batch(pairs):
+    """对所有 pairs 分批推理，每批推理后立即释放中间张量，避免显存峰值过高。"""
+    if reranker_session is None:
+        raise RuntimeError("Reranker model not loaded")
+
+    if not pairs:
+        return np.array([], dtype=np.float32)
+
+    all_logits = []
+    for start in range(0, len(pairs), RERANK_BATCH_SIZE):
+        chunk = pairs[start:start + RERANK_BATCH_SIZE]
+        _, input_feed = _build_rerank_inputs(chunk)
+        with _inference_semaphore:
+            outputs = reranker_session.run(None, input_feed)
+        logits = np.asarray(outputs[0]).reshape(-1)
+        del outputs, input_feed
+        all_logits.append(logits)
+
+    return np.concatenate(all_logits)
 
 
 def _build_rerank_inputs(pairs):
@@ -264,12 +295,12 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    embedding_session = None
-    reranker_session = None
-    embedding_tokenizer = None
-    reranker_tokenizer = None
-    runtime_provider = None
-    embedding_batch_size = 1
+    del embedding_session
+    del reranker_session
+    del embedding_tokenizer
+    del reranker_tokenizer
+    gc.collect()
+    LOGGER.info("Shutdown complete, GPU resources released.")
 
 
 app = FastAPI(
@@ -369,8 +400,7 @@ async def simple_rerank(request: RerankRequest):
             _format_instruction(request.instruction, request.query, doc)
             for doc in request.documents
         ]
-        _, input_feed = _build_rerank_inputs(pairs)
-        logits = np.asarray(reranker_session.run(None, input_feed)[0]).reshape(-1)  # type: ignore[union-attr]
+        logits = _run_rerank_batch(pairs)
         scores = _sigmoid(logits)
 
         results = [
