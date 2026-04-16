@@ -10,7 +10,11 @@ import numpy as np
 import onnxruntime as ort
 from transformers import AutoTokenizer
 
-from onnx_provider_utils import choose_execution_providers, provider_chain_to_string
+from onnx_provider_utils import (
+    build_provider_chain,
+    choose_execution_providers,
+    provider_chain_to_string,
+)
 import text_service_pb2
 import text_service_pb2_grpc
 
@@ -55,13 +59,26 @@ LOGGER = logging.getLogger(__name__)
 
 def _get_execution_providers():
     providers, reason, available = choose_execution_providers()
+    configured = build_provider_chain(providers)
     LOGGER.info(
         "Selected ONNX providers: %s | reason=%s | available=%s",
-        provider_chain_to_string(providers),
+        provider_chain_to_string(configured),
         reason,
         available,
     )
-    return providers
+    return configured
+
+
+def _create_run_options():
+    raw_value = os.environ.get("ORT_ENABLE_GPU_ARENA_SHRINKAGE", "").strip().lower()
+    if raw_value not in {"1", "true", "yes", "on"}:
+        return None
+
+    run_options = ort.RunOptions()
+    target = os.environ.get("ORT_GPU_ARENA_SHRINKAGE_TARGET", "gpu:0").strip() or "gpu:0"
+    run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", target)
+    LOGGER.info("Enabled ORT GPU arena shrinkage after each run: target=%s", target)
+    return run_options
 
 
 def _create_session(model_path):
@@ -136,6 +153,7 @@ def _resolve_embedding_batch_size(session, tokenizer, requested_batch_size):
             if key in model_inputs
         }
         session.run(None, input_feed)
+        del encoded, input_feed
         return requested_batch_size
     except Exception as exc:
         LOGGER.warning(
@@ -168,6 +186,8 @@ class TextGrpcServiceServicer(text_service_pb2_grpc.TextGrpcServiceServicer):
 
         self.embedding_session = _create_session(EMBEDDING_MODEL_PATH)
         self.reranker_session = _create_session(RERANKER_MODEL_PATH)
+        self.embedding_run_options = _create_run_options()
+        self.reranker_run_options = _create_run_options()
         self.embedding_batch_size = _resolve_embedding_batch_size(
             self.embedding_session,
             self.embedding_tokenizer,
@@ -206,7 +226,11 @@ class TextGrpcServiceServicer(text_service_pb2_grpc.TextGrpcServiceServicer):
             chunk_texts = texts[start:start + self.embedding_batch_size]
             encoded, input_feed = self._build_embedding_inputs(chunk_texts)
             with _inference_semaphore:
-                outputs = self.embedding_session.run(None, input_feed)
+                outputs = self.embedding_session.run(
+                    None,
+                    input_feed,
+                    run_options=self.embedding_run_options,
+                )
             last_hidden_state = np.asarray(outputs[0])
             del outputs
             pooled = _last_token_pool(last_hidden_state, encoded["attention_mask"])
@@ -219,7 +243,7 @@ class TextGrpcServiceServicer(text_service_pb2_grpc.TextGrpcServiceServicer):
                 for text in chunk_texts
             )
             total_tokens += int(np.asarray(encoded["attention_mask"]).sum())
-            del input_feed
+            del encoded, input_feed
 
         return np.stack(embeddings, axis=0), text_lengths, total_tokens
 
@@ -231,11 +255,15 @@ class TextGrpcServiceServicer(text_service_pb2_grpc.TextGrpcServiceServicer):
         all_logits = []
         for start in range(0, len(pairs), RERANK_BATCH_SIZE):
             chunk = pairs[start:start + RERANK_BATCH_SIZE]
-            _, input_feed = self._build_rerank_inputs(chunk)
+            encoded, input_feed = self._build_rerank_inputs(chunk)
             with _inference_semaphore:
-                outputs = self.reranker_session.run(None, input_feed)
+                outputs = self.reranker_session.run(
+                    None,
+                    input_feed,
+                    run_options=self.reranker_run_options,
+                )
             logits = np.asarray(outputs[0]).reshape(-1)
-            del outputs, input_feed
+            del encoded, outputs, input_feed
             all_logits.append(logits)
 
         return np.concatenate(all_logits)
@@ -422,6 +450,8 @@ def serve():
         servicer.reranker_session = None
         servicer.embedding_tokenizer = None
         servicer.reranker_tokenizer = None
+        servicer.embedding_run_options = None
+        servicer.reranker_run_options = None
         gc.collect()
         LOGGER.info("gRPC server stopped, GPU resources released.")
 

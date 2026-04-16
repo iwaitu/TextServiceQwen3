@@ -15,7 +15,11 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import numpy as np
 import onnxruntime as ort
-from onnx_provider_utils import choose_execution_providers, provider_chain_to_string
+from onnx_provider_utils import (
+    build_provider_chain,
+    choose_execution_providers,
+    provider_chain_to_string,
+)
 from pydantic import BaseModel
 from transformers import AutoTokenizer
 
@@ -63,6 +67,8 @@ embedding_session: Optional[ort.InferenceSession] = None
 reranker_session: Optional[ort.InferenceSession] = None
 runtime_provider: Optional[str] = None
 embedding_batch_size = 1
+embedding_run_options: Optional[ort.RunOptions] = None
+reranker_run_options: Optional[ort.RunOptions] = None
 
 
 def _resolve_model_name(model_dir, fallback_name):
@@ -89,6 +95,7 @@ def _resolve_embedding_batch_size(session, tokenizer, requested_batch_size):
             if key in model_inputs
         }
         session.run(None, input_feed)
+        del encoded, input_feed
         return requested_batch_size
     except Exception as exc:
         LOGGER.warning(
@@ -102,13 +109,26 @@ def _resolve_embedding_batch_size(session, tokenizer, requested_batch_size):
 
 def _get_execution_providers():
     providers, reason, available = choose_execution_providers()
+    configured = build_provider_chain(providers)
     LOGGER.info(
         "Selected ONNX providers: %s | reason=%s | available=%s",
-        provider_chain_to_string(providers),
+        provider_chain_to_string(configured),
         reason,
         available,
     )
-    return providers
+    return configured
+
+
+def _create_run_options():
+    raw_value = os.environ.get("ORT_ENABLE_GPU_ARENA_SHRINKAGE", "").strip().lower()
+    if raw_value not in {"1", "true", "yes", "on"}:
+        return None
+
+    run_options = ort.RunOptions()
+    target = os.environ.get("ORT_GPU_ARENA_SHRINKAGE_TARGET", "gpu:0").strip() or "gpu:0"
+    run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", target)
+    LOGGER.info("Enabled ORT GPU arena shrinkage after each run: target=%s", target)
+    return run_options
 
 
 def _create_session(model_path):
@@ -200,7 +220,11 @@ def _run_embedding_batch(texts):
         chunk_texts = texts[start:start + embedding_batch_size]
         encoded, input_feed = _build_embedding_inputs(chunk_texts)
         with _inference_semaphore:
-            outputs = embedding_session.run(None, input_feed)
+            outputs = embedding_session.run(
+                None,
+                input_feed,
+                run_options=embedding_run_options,
+            )
         last_hidden_state = np.asarray(outputs[0])
         del outputs
         pooled = _last_token_pool(last_hidden_state, encoded["attention_mask"])
@@ -213,7 +237,7 @@ def _run_embedding_batch(texts):
             for text in chunk_texts
         )
         total_tokens += int(np.asarray(encoded["attention_mask"]).sum())
-        del input_feed
+        del encoded, input_feed
 
     return np.stack(embeddings, axis=0), text_lengths, total_tokens
 
@@ -229,11 +253,15 @@ def _run_rerank_batch(pairs):
     all_logits = []
     for start in range(0, len(pairs), RERANK_BATCH_SIZE):
         chunk = pairs[start:start + RERANK_BATCH_SIZE]
-        _, input_feed = _build_rerank_inputs(chunk)
+        encoded, input_feed = _build_rerank_inputs(chunk)
         with _inference_semaphore:
-            outputs = reranker_session.run(None, input_feed)
+            outputs = reranker_session.run(
+                None,
+                input_feed,
+                run_options=reranker_run_options,
+            )
         logits = np.asarray(outputs[0]).reshape(-1)
-        del outputs, input_feed
+        del encoded, outputs, input_feed
         all_logits.append(logits)
 
     return np.concatenate(all_logits)
@@ -263,6 +291,7 @@ def _build_rerank_inputs(pairs):
 async def lifespan(app: FastAPI):
     global embedding_tokenizer, reranker_tokenizer
     global embedding_session, reranker_session, runtime_provider, embedding_batch_size
+    global embedding_run_options, reranker_run_options
 
     LOGGER.info("Starting up: loading ONNX models...")
     try:
@@ -280,6 +309,8 @@ async def lifespan(app: FastAPI):
         )
         embedding_session = _create_session(EMBEDDING_MODEL_PATH)
         reranker_session = _create_session(RERANKER_MODEL_PATH)
+        embedding_run_options = _create_run_options()
+        reranker_run_options = _create_run_options()
         embedding_batch_size = _resolve_embedding_batch_size(
             embedding_session,
             embedding_tokenizer,
@@ -299,6 +330,8 @@ async def lifespan(app: FastAPI):
     del reranker_session
     del embedding_tokenizer
     del reranker_tokenizer
+    del embedding_run_options
+    del reranker_run_options
     gc.collect()
     LOGGER.info("Shutdown complete, GPU resources released.")
 

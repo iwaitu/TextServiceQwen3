@@ -31,6 +31,13 @@ Thumbs.db
 *.md
 LICENSE
 
+# 模型：默认忽略全部，只保留服务实际使用的两个 ONNX 模型目录
+Models/*
+!Models/qwen3-embedding-0.6b-onnx/
+!Models/qwen3-embedding-0.6b-onnx/**
+!Models/qwen3-reranker-seq-cls-onnx/
+!Models/qwen3-reranker-seq-cls-onnx/**
+
 # Docker相关
 Dockerfile
 .dockerignore

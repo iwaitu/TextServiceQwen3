@@ -18,6 +18,8 @@ _PROVIDER_ALIASES = {
     "auto": "auto",
 }
 
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+
 
 def _normalize_provider_name(name):
     normalized = name.strip()
@@ -32,6 +34,44 @@ def _parse_provider_chain(raw_value):
         if normalized and normalized != "auto":
             providers.append(normalized)
     return providers
+
+
+def _env_flag(name, default=False):
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in _TRUE_VALUES
+
+
+def _build_cuda_provider_options():
+    options = {
+        # Avoid the default arena growth behavior from holding onto a much larger
+        # GPU cache after occasional large requests.
+        "arena_extend_strategy": os.environ.get(
+            "ORT_CUDA_ARENA_EXTEND_STRATEGY",
+            "kSameAsRequested",
+        ).strip() or "kSameAsRequested",
+    }
+
+    device_id = os.environ.get("ORT_CUDA_DEVICE_ID", "").strip()
+    if device_id:
+        options["device_id"] = device_id
+
+    gpu_mem_limit_mb = os.environ.get("ORT_CUDA_GPU_MEM_LIMIT_MB", "").strip()
+    if gpu_mem_limit_mb:
+        options["gpu_mem_limit"] = str(int(gpu_mem_limit_mb) * 1024 * 1024)
+
+    if "ORT_CUDA_CUDNN_CONV_USE_MAX_WORKSPACE" in os.environ:
+        options["cudnn_conv_use_max_workspace"] = (
+            "1" if _env_flag("ORT_CUDA_CUDNN_CONV_USE_MAX_WORKSPACE") else "0"
+        )
+
+    if "ORT_CUDA_DO_COPY_IN_DEFAULT_STREAM" in os.environ:
+        options["do_copy_in_default_stream"] = (
+            "1" if _env_flag("ORT_CUDA_DO_COPY_IN_DEFAULT_STREAM", True) else "0"
+        )
+
+    return options
 
 
 def choose_execution_providers():
@@ -63,5 +103,25 @@ def choose_execution_providers():
     return [CPU_PROVIDER], "defaulted to CPUExecutionProvider", available
 
 
+def build_provider_chain(providers):
+    configured = []
+    for provider in providers:
+        if provider == CUDA_PROVIDER:
+            configured.append((CUDA_PROVIDER, _build_cuda_provider_options()))
+        else:
+            configured.append(provider)
+    return configured
+
+
 def provider_chain_to_string(providers):
-    return " -> ".join(providers)
+    parts = []
+    for provider in providers:
+        if isinstance(provider, tuple):
+            name, options = provider
+            if options:
+                parts.append(f"{name}{options}")
+            else:
+                parts.append(name)
+        else:
+            parts.append(provider)
+    return " -> ".join(parts)

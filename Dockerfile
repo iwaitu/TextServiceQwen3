@@ -31,8 +31,13 @@ RUN grep -v "^onnxruntime\(\[.*\]\)\?>=" requirements.txt > requirements.docker.
     && python -m pip install --no-cache-dir -r requirements.docker.txt \
     && python -m pip install --no-cache-dir "onnxruntime-gpu>=1.18.0"
 
-# 复制项目文件
-COPY . .
+# 复制运行 gRPC 服务所需的最小文件集
+COPY grpc_service.py ./
+COPY onnx_provider_utils.py ./
+COPY text_service_pb2.py ./
+COPY text_service_pb2_grpc.py ./
+COPY Models/qwen3-embedding-0.6b-onnx ./Models/qwen3-embedding-0.6b-onnx
+COPY Models/qwen3-reranker-seq-cls-onnx ./Models/qwen3-reranker-seq-cls-onnx
 
 # 设置环境变量
 ENV GRPC_PORT=32688
