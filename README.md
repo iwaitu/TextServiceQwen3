@@ -235,6 +235,12 @@ rerank_response = stub.SimpleRerank(rerank_request)
 - `EMBEDDING_MAX_LENGTH`: Embedding 最大输入长度，默认 8192
 - `RERANK_MAX_LENGTH`: Rerank 最大输入长度，默认 8192
 - `EMBEDDING_BATCH_SIZE`: Embedding 推理批大小，默认 8
+- `RERANK_BATCH_SIZE`: Rerank 推理批大小，默认 4
+- `EMBEDDING_MAX_BATCH_TOKENS`: Embedding 每批 padded token 上限，默认 8192
+- `RERANK_MAX_BATCH_TOKENS`: Rerank 每批 padded token 上限，默认 8192
+- `MAX_CONCURRENT_INFERENCES`: GPU 推理并发上限，默认 1
+- `ORT_CUDA_GPU_MEM_LIMIT_MB`: ONNX Runtime CUDA arena 上限，Docker 默认 24576 MiB
+- `ORT_ENABLE_GPU_ARENA_SHRINKAGE`: 每轮推理后收缩 GPU arena，Docker 默认开启
 - `ONNX_EXECUTION_PROVIDERS`: 显式指定 ONNX Runtime Provider 链
 - `ONNX_PREFERRED_PROVIDER`: 指定首选 Provider
 - `ONNX_PROVIDER`: 兼容单 Provider 配置

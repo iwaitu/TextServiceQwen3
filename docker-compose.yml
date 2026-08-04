@@ -12,6 +12,11 @@ services:
       - EMBEDDING_MODEL_DIR=/app/Models/qwen3-embedding-0.6b-onnx
       - RERANKER_MODEL_DIR=/app/Models/qwen3-reranker-seq-cls-onnx
       - ONNX_EXECUTION_PROVIDERS=CUDAExecutionProvider,CPUExecutionProvider
+      - MAX_CONCURRENT_INFERENCES=1
+      - EMBEDDING_MAX_BATCH_TOKENS=8192
+      - RERANK_MAX_BATCH_TOKENS=8192
+      - ORT_CUDA_GPU_MEM_LIMIT_MB=24576
+      - ORT_ENABLE_GPU_ARENA_SHRINKAGE=1
       - CUDA_VISIBLE_DEVICES=0  # 指定使用哪个GPU
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility

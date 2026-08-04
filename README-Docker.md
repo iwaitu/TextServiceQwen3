@@ -113,7 +113,10 @@ docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
 
 ### GPU 内存优化
 - 设置适当的 `CUDA_VISIBLE_DEVICES`
-- 调整批处理大小
+- 通过 `EMBEDDING_MAX_BATCH_TOKENS` 和 `RERANK_MAX_BATCH_TOKENS` 限制动态 padding 后的每批 token 数
+- 通过 `MAX_CONCURRENT_INFERENCES` 限制同时执行的 GPU 推理数
+- 保持 `ORT_ENABLE_GPU_ARENA_SHRINKAGE=1`，避免偶发长请求的 CUDA arena 长期占用峰值显存
+- 使用 `ORT_CUDA_GPU_MEM_LIMIT_MB` 为 ONNX Runtime CUDA arena 保留安全边界
 - 启用模型量化（如适用）
 
 ### 容器资源限制

@@ -11,6 +11,11 @@ ENV CUDA_VISIBLE_DEVICES=0
 ENV EMBEDDING_MODEL_DIR=/app/Models/qwen3-embedding-0.6b-onnx
 ENV RERANKER_MODEL_DIR=/app/Models/qwen3-reranker-seq-cls-onnx
 ENV ONNX_EXECUTION_PROVIDERS=CUDAExecutionProvider,CPUExecutionProvider
+ENV MAX_CONCURRENT_INFERENCES=1
+ENV EMBEDDING_MAX_BATCH_TOKENS=8192
+ENV RERANK_MAX_BATCH_TOKENS=8192
+ENV ORT_CUDA_GPU_MEM_LIMIT_MB=24576
+ENV ORT_ENABLE_GPU_ARENA_SHRINKAGE=1
 
 # 安装 Python 和系统依赖。Ubuntu 22.04 默认提供 Python 3.10，直接使用 python3 包更稳妥。
 RUN apt-get update && apt-get install -y --no-install-recommends \

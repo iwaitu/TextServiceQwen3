@@ -40,7 +40,15 @@ EMBED_MAX_LENGTH = int(os.environ.get("EMBEDDING_MAX_LENGTH", "8192"))
 RERANK_MAX_LENGTH = int(os.environ.get("RERANK_MAX_LENGTH", "8192"))
 EMBED_BATCH_SIZE = max(1, int(os.environ.get("EMBEDDING_BATCH_SIZE", "8")))
 RERANK_BATCH_SIZE = max(1, int(os.environ.get("RERANK_BATCH_SIZE", "4")))
-_MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_INFERENCES", "2"))
+EMBED_MAX_BATCH_TOKENS = max(
+    1,
+    int(os.environ.get("EMBEDDING_MAX_BATCH_TOKENS", str(EMBED_MAX_LENGTH))),
+)
+RERANK_MAX_BATCH_TOKENS = max(
+    1,
+    int(os.environ.get("RERANK_MAX_BATCH_TOKENS", str(RERANK_MAX_LENGTH))),
+)
+_MAX_CONCURRENT = max(1, int(os.environ.get("MAX_CONCURRENT_INFERENCES", "1")))
 _inference_semaphore = threading.Semaphore(_MAX_CONCURRENT)
 
 DEFAULT_RERANK_INSTRUCTION = (
@@ -133,6 +141,40 @@ def _resolve_model_name(model_dir, fallback_name):
     return os.path.basename(os.path.normpath(model_dir)) or fallback_name
 
 
+def _iter_token_budget_batches(values, tokenizer, max_length, max_batch_size, max_batch_tokens):
+    """Build batches without letting padding multiply one long input across the batch."""
+    batch = []
+    batch_lengths = []
+    padded_length = 0
+
+    for value in values:
+        original_token_length = len(
+            tokenizer.encode(
+                value,
+                add_special_tokens=False,
+                verbose=False,
+            )
+        )
+        special_token_count = tokenizer.num_special_tokens_to_add(pair=False)
+        token_length = min(original_token_length + special_token_count, max_length)
+        next_padded_length = max(padded_length, token_length)
+        exceeds_size = len(batch) >= max_batch_size
+        exceeds_tokens = next_padded_length * (len(batch) + 1) > max_batch_tokens
+
+        if batch and (exceeds_size or exceeds_tokens):
+            yield batch, batch_lengths
+            batch = []
+            batch_lengths = []
+            padded_length = 0
+
+        batch.append(value)
+        batch_lengths.append(original_token_length)
+        padded_length = max(padded_length, token_length)
+
+    if batch:
+        yield batch, batch_lengths
+
+
 def _resolve_embedding_batch_size(session, tokenizer, requested_batch_size):
     if requested_batch_size <= 1:
         return 1
@@ -197,6 +239,13 @@ class TextGrpcServiceServicer(text_service_pb2_grpc.TextGrpcServiceServicer):
         LOGGER.info("Embedding session providers: %s", self.embedding_session.get_providers())
         LOGGER.info("Reranker session providers: %s", self.reranker_session.get_providers())
         LOGGER.info("Embedding effective batch size: %s", self.embedding_batch_size)
+        LOGGER.info(
+            "Inference limits: concurrency=%s embedding_batch_tokens=%s "
+            "rerank_batch_tokens=%s",
+            _MAX_CONCURRENT,
+            EMBED_MAX_BATCH_TOKENS,
+            RERANK_MAX_BATCH_TOKENS,
+        )
 
     def _build_embedding_inputs(self, texts):
         encoded = self.embedding_tokenizer(
@@ -222,8 +271,14 @@ class TextGrpcServiceServicer(text_service_pb2_grpc.TextGrpcServiceServicer):
         text_lengths = []
         total_tokens = 0
 
-        for start in range(0, len(texts), self.embedding_batch_size):
-            chunk_texts = texts[start:start + self.embedding_batch_size]
+        batches = _iter_token_budget_batches(
+            texts,
+            self.embedding_tokenizer,
+            EMBED_MAX_LENGTH,
+            self.embedding_batch_size,
+            EMBED_MAX_BATCH_TOKENS,
+        )
+        for chunk_texts, chunk_lengths in batches:
             encoded, input_feed = self._build_embedding_inputs(chunk_texts)
             with _inference_semaphore:
                 outputs = self.embedding_session.run(
@@ -238,10 +293,7 @@ class TextGrpcServiceServicer(text_service_pb2_grpc.TextGrpcServiceServicer):
             normalized = _normalize_embeddings(pooled).astype(np.float32)
             del pooled
             embeddings.extend(normalized)
-            text_lengths.extend(
-                len(self.embedding_tokenizer.encode(text, add_special_tokens=False))
-                for text in chunk_texts
-            )
+            text_lengths.extend(chunk_lengths)
             total_tokens += int(np.asarray(encoded["attention_mask"]).sum())
             del encoded, input_feed
 
@@ -253,8 +305,14 @@ class TextGrpcServiceServicer(text_service_pb2_grpc.TextGrpcServiceServicer):
             return np.array([], dtype=np.float32)
 
         all_logits = []
-        for start in range(0, len(pairs), RERANK_BATCH_SIZE):
-            chunk = pairs[start:start + RERANK_BATCH_SIZE]
+        batches = _iter_token_budget_batches(
+            pairs,
+            self.reranker_tokenizer,
+            RERANK_MAX_LENGTH,
+            RERANK_BATCH_SIZE,
+            RERANK_MAX_BATCH_TOKENS,
+        )
+        for chunk, _ in batches:
             encoded, input_feed = self._build_rerank_inputs(chunk)
             with _inference_semaphore:
                 outputs = self.reranker_session.run(
